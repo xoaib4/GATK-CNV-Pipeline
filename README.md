@@ -20,13 +20,14 @@ This pipeline performs **multi-sample germline CNV discovery** using [GATK Germl
 
 ## Usage
 
-```bash
+```
 chmod +x gatk_cnv_pipeline.sh
 
 ./gatk_cnv_pipeline.sh \
   -r ref/Homo_sapiens_assembly38.fasta \
   -b targets.bed \
   -l bam_list.txt
+```
 ## Output Structure
 After running, the script will create:
 
