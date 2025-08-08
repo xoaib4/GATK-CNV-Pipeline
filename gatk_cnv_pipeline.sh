@@ -1,131 +1,89 @@
 #!/usr/bin/env bash
 
 # Usage:
-# ./gatk_cnv_pipeline.sh -r path/to/reference.fasta -b path/to/targets.bed -l bam_list.txt
+# ./gatk_cnv_pipeline.sh -r reference.fasta -b targets.bed -l bam_list.txt -p ploidy_priors.tsv
 
-# -------------
-# Input Parsing
-# -------------
+set -euo pipefail
 
-while getopts "r:b:l:" opt; do
-  case $opt in
-    r) REFERENCE=$OPTARG ;;
-    b) TARGETS=$OPTARG ;;
-    l) BAM_LIST_FILE=$OPTARG ;;
-    \?) echo "Invalid option -$OPTARG" >&2; exit 1 ;;
+# Parse arguments
+while getopts ":r:b:l:p:" opt; do
+  case ${opt} in
+    r ) REF=${OPTARG};;
+    b ) BED=${OPTARG};;
+    l ) BAM_LIST=${OPTARG};;
+    p ) PLOIDY_PRIORS=${OPTARG};;
+    \? ) echo "Usage: cmd [-r reference] [-b bed_file] [-l bam_list] [-p ploidy_priors]"; exit 1;;
   esac
 done
 
-# Check required files
-if [[ ! -f $REFERENCE || ! -f $TARGETS || ! -f $BAM_LIST_FILE ]]; then
-  echo "Missing required input(s). Please check reference, targets, or BAM list." >&2
+if [[ -z "${REF:-}" || -z "${BED:-}" || -z "${BAM_LIST:-}" || -z "${PLOIDY_PRIORS:-}" ]]; then
+  echo "Missing required arguments. Use -r, -b, -l, and -p."
   exit 1
 fi
 
-# ------------------------
-# Set up derived variables
-# ------------------------
-
 WORKDIR="gatk_cnv_work"
-mkdir -p "$WORKDIR/cvg" "$WORKDIR/ploidy"
+COVERAGE_DIR="$WORKDIR/cvg"
+PLOIDY_DIR="$WORKDIR/ploidy"
+CNV_DIR="$WORKDIR/cohort_cnv"
 
-PREPROCESSED_INTERVALS="$WORKDIR/targets.preprocessed.interval_list"
-ANNOTATED_INTERVALS="$WORKDIR/targets.annotated.tsv"
-FILTERED_INTERVALS="$WORKDIR/targets.filtered.interval_list"
-CONTIG_PRIORS="$WORKDIR/contig_ploidy_priors.tsv"
+mkdir -p "$WORKDIR" "$COVERAGE_DIR" "$PLOIDY_DIR" "$CNV_DIR"
 
-# Dummy priors file
-echo -e "CONTIG_NAME\tPLOIDY_PRIOR_0\tPLOIDY_PRIOR_1\tPLOIDY_PRIOR_2" > $CONTIG_PRIORS
-echo -e "chr1\t0.01\t0.1\t0.89" >> $CONTIG_PRIORS
-
-# -----------------------------------
-# Step 1: Preprocess target intervals
-# -----------------------------------
+# Step 1: Preprocess Intervals
 gatk PreprocessIntervals \
-  -R "$REFERENCE" \
-  -L "$TARGETS" \
+  -R "$REF" \
+  -L "$BED" \
   --bin-length 0 \
   -imr OVERLAPPING_ONLY \
-  -O "$PREPROCESSED_INTERVALS"
+  -O "$WORKDIR/targets.preprocessed.interval_list"
 
-# --------------------------
-# Step 2: CollectReadCounts
-# --------------------------
-
-BAM_COUNT=0
-READCOUNT_INPUTS=()
-while read -r BAM; do
-  BAM_NAME=$(basename "$BAM" .bam)
-  OUTPUT_TSV="$WORKDIR/cvg/${BAM_NAME}.tsv"
-
+# Step 2: Collect Read Counts
+while IFS= read -r BAM; do
+  SAMPLE=$(basename "$BAM" .bam)
   gatk CollectReadCounts \
-    -L "$PREPROCESSED_INTERVALS" \
-    -R "$REFERENCE" \
+    -L "$WORKDIR/targets.preprocessed.interval_list" \
+    -R "$REF" \
+    -imr OVERLAPPING_ONLY \
     -I "$BAM" \
     --format TSV \
-    -imr OVERLAPPING_ONLY \
-    -O "$OUTPUT_TSV"
+    -O "$COVERAGE_DIR/$SAMPLE.tsv"
+done < "$BAM_LIST"
 
-  READCOUNT_INPUTS+=("-I" "$OUTPUT_TSV")
-  ((BAM_COUNT++))
-done < "$BAM_LIST_FILE"
-
-# --------------------------
-# Step 3: Annotate intervals
-# --------------------------
+# Step 3: Annotate Intervals
 gatk AnnotateIntervals \
-  -L "$PREPROCESSED_INTERVALS" \
-  -R "$REFERENCE" \
+  -L "$WORKDIR/targets.preprocessed.interval_list" \
+  -R "$REF" \
   -imr OVERLAPPING_ONLY \
-  -O "$ANNOTATED_INTERVALS"
+  -O "$WORKDIR/targets.annotated.tsv"
 
-# --------------------------
-# Step 4: Filter intervals
-# --------------------------
+# Step 4: Filter Intervals
+INPUTS=()
+for TSV in "$COVERAGE_DIR"/*.tsv; do
+  INPUTS+=("-I" "$TSV")
+done
+
 gatk FilterIntervals \
-  -L "$PREPROCESSED_INTERVALS" \
-  --annotated-intervals "$ANNOTATED_INTERVALS" \
-  "${READCOUNT_INPUTS[@]}" \
+  -L "$WORKDIR/targets.preprocessed.interval_list" \
+  --annotated-intervals "$WORKDIR/targets.annotated.tsv" \
+  "${INPUTS[@]}" \
   -imr OVERLAPPING_ONLY \
-  -O "$FILTERED_INTERVALS"
+  -O "$WORKDIR/targets.filtered.interval_list"
 
-# ---------------------------------------
-# Step 5: Determine Germline Contig Ploidy
-# ---------------------------------------
+# Step 5: Determine Contig Ploidy
 gatk DetermineGermlineContigPloidy \
-  -L "$FILTERED_INTERVALS" \
-  "${READCOUNT_INPUTS[@]}" \
+  -L "$WORKDIR/targets.filtered.interval_list" \
   --interval-merging-rule OVERLAPPING_ONLY \
-  --contig-ploidy-priors "$CONTIG_PRIORS" \
-  --output "$WORKDIR/ploidy" \
+  "${INPUTS[@]}" \
+  --contig-ploidy-priors "$PLOIDY_PRIORS" \
+  --output "$PLOIDY_DIR" \
   --output-prefix ploidy
 
-# --------------------------
-# Step 6: GermlineCNVCaller
-# --------------------------
-
+# Step 6: Germline CNV Calling
 gatk GermlineCNVCaller \
   --run-mode COHORT \
-  -L "$FILTERED_INTERVALS" \
-  "${READCOUNT_INPUTS[@]}" \
-  --contig-ploidy-calls "$WORKDIR/ploidy" \
-  --annotated-intervals "$ANNOTATED_INTERVALS" \
+  -L "$WORKDIR/targets.filtered.interval_list" \
+  "${INPUTS[@]}" \
+  --contig-ploidy-calls "$PLOIDY_DIR/ploidy-calls" \
+  --annotated-intervals "$WORKDIR/targets.annotated.tsv" \
   --interval-merging-rule OVERLAPPING_ONLY \
-  --output "$WORKDIR/cohort_cnv" \
+  --output "$CNV_DIR" \
   --output-prefix cohort_all
-
-# -----------------------------
-# Step 7: Post-process example
-# -----------------------------
-
-# You must loop this per-sample to get VCFs
-# Replace "NA19017" with each sample name
-gatk PostprocessGermlineCNVCalls \
-  --model-shard-path "$WORKDIR/cohort_cnv/cohort_all-model" \
-  --calls-shard-path "$WORKDIR/cohort_cnv/cohort_all-calls" \
-  --allosomal-contig chrX --allosomal-contig chrY \
-  --contig-ploidy-calls "$WORKDIR/ploidy" \
-  --sample-index 0 \
-  --output-genotyped-intervals "$WORKDIR/NA19017.genotyped.intervals.vcf.gz" \
-  --output-genotyped-segments "$WORKDIR/NA19017.genotyped.segments.vcf.gz" \
-  --sequence-dictionary "${REFERENCE%.fasta}.dict"
